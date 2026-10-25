@@ -77,6 +77,20 @@ jobs:
           echo "Les 3 tentatives ont échoué."
           exit 1
  
+      - name: Inspecter l'app compilée (diagnostic)
+        run: |
+          APP=build/ios/iphoneos/Runner.app
+          echo "--- Frameworks ---"
+          ls "$APP/Frameworks" || true
+          echo "--- Bibliothèques vodozemac / dylib ---"
+          find "$APP" \( -iname "*vodozemac*" -o -iname "*.dylib" \) | head -50
+          echo "--- Info.plist (extraits) ---"
+          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion|MinimumOSVersion|UIApplicationSceneManifest|DTSDKName|DTXcode" || true
+          echo "--- Architecture ---"
+          lipo -info "$APP/Runner" || file "$APP/Runner"
+          echo "--- Taille ---"
+          du -sh "$APP"
+ 
       - name: Fabriquer l'IPA
         run: |
           mkdir -p Payload
