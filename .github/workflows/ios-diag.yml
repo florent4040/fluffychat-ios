@@ -1,0 +1,167 @@
+name: FluffyChat iOS DIAGNOSTIC (affiche les etapes de demarrage)
+ 
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Version de FluffyChat (laisse v2.11.3)"
+        default: "v2.11.3"
+ 
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Recuperer le code officiel de FluffyChat
+        uses: actions/checkout@v4
+        with:
+          repository: krille-chan/fluffychat
+          ref: ${{ github.event.inputs.ref }}
+ 
+      - name: Detecter la version de Flutter du projet
+        id: flutter_version
+        run: |
+          VERSION=""
+          if [ -f .fvmrc ]; then
+            cat .fvmrc
+            VERSION=$(grep -i flutter .fvmrc | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+          fi
+          if [ -z "$VERSION" ] && [ -f .tool_versions.yaml ]; then
+            cat .tool_versions.yaml
+            VERSION=$(grep -i flutter .tool_versions.yaml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+          fi
+          echo "Version de Flutter detectee : '${VERSION}'"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+ 
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          channel: stable
+          cache: true
+ 
+      - name: Installer Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+ 
+      - name: Activer Swift Package Manager
+        run: flutter config --enable-swift-package-manager
+ 
+      - name: Dependances
+        run: flutter pub get
+ 
+      # Ce patch ne modifie que la copie de FluffyChat compilee ici (jamais le depot officiel).
+      # Il affiche a l'ecran chaque etape du demarrage et l'erreur eventuelle.
+      - name: Ajouter l'affichage de diagnostic dans lib/main.dart
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          p = 'lib/main.dart'
+          s = open(p, encoding='utf-8').read()
+ 
+          def rep(old, new):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  print('ECHEC du patch, motif trouve %d fois : %r' % (n, old[:70]))
+                  sys.exit(1)
+              s = s.replace(old, new)
+ 
+          DIAG = r'''
+          // ---- DIAGNOSTIC (ajoute par le workflow) ----
+          final ValueNotifier<String> _diag = ValueNotifier<String>('FluffyChat diagnostic');
+ 
+          void _d(String m) {
+            final t = DateTime.now().toIso8601String().substring(11, 19);
+            _diag.value = '${_diag.value}\n$t $m';
+          }
+ 
+          void _diagShow() {
+            runApp(
+              Directionality(
+                textDirection: TextDirection.ltr,
+                child: Container(
+                  color: const Color(0xFF004D40),
+                  padding: const EdgeInsets.fromLTRB(16, 60, 16, 16),
+                  child: SingleChildScrollView(
+                    child: ValueListenableBuilder<String>(
+                      valueListenable: _diag,
+                      builder: (_, v, __) => Text(
+                        v,
+                        style: const TextStyle(
+                          color: Color(0xFFFFFFFF),
+                          fontSize: 13,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+          // ---- FIN DIAGNOSTIC ----
+          '''
+ 
+          rep("ReceivePort? mainIsolateReceivePort;\n",
+              "ReceivePort? mainIsolateReceivePort;\n" + DIAG)
+ 
+          rep("  WidgetsFlutterBinding.ensureInitialized();\n\n  final store = await AppSettings.init();\n",
+              "  WidgetsFlutterBinding.ensureInitialized();\n  _diagShow();\n  _d('1 moteur Flutter OK');\n  _d('2 AppSettings.init ...');\n  final store = await AppSettings.init();\n  _d('2 AppSettings OK');\n")
+ 
+          rep("  if (!_vodozemacInitialized) {\n    await vod.init(\n",
+              "  _d('3 vodozemac init ...');\n  if (!_vodozemacInitialized) {\n    await vod.init(\n")
+ 
+          rep("  Logs().nativeColors = !PlatformInfos.isIOS;\n",
+              "  _d('3 vodozemac OK');\n  Logs().nativeColors = !PlatformInfos.isIOS;\n")
+ 
+          rep("  final clients = await ClientManager.getClients(store: store);\n\n  // Started in foreground mode.\n",
+              "  _d('4 ouverture des comptes et de la base ...');\n  final clients = await ClientManager.getClients(store: store);\n  _d('4 comptes OK');\n\n  // Started in foreground mode.\n")
+ 
+          rep("  // Preload first client\n",
+              "  _d('5a lecture PIN OK, chargement du 1er compte ...');\n  // Preload first client\n")
+ 
+          rep("  await firstClient?.accountDataLoading;\n",
+              "  await firstClient?.accountDataLoading;\n  _d('5b chargement du compte OK');\n")
+ 
+          rep("  runApp(\n    FluffyChatApp(\n",
+              "  _d('6 lancement de l interface dans 4 secondes');\n  await Future.delayed(const Duration(seconds: 4));\n  runApp(\n    FluffyChatApp(\n")
+ 
+          rep("}, ErrorReporter.onFlutterError);\n",
+              "}, (Object e, StackTrace st) {\n  _d('ERREUR : $e\\n$st');\n  try {\n    ErrorReporter.onFlutterError(e, st);\n  } catch (_) {}\n});\n")
+ 
+          open(p, 'w', encoding='utf-8').write(s)
+          print('Patch applique.')
+          PYEOF
+          grep -n "_d(" lib/main.dart | head -30
+ 
+      # Echoue vite (1-2 min) si le patch contient une erreur de syntaxe
+      - name: Verifier que le code compile
+        run: flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings lib/main.dart
+ 
+      - name: Compiler sans signature (3 tentatives)
+        run: |
+          for i in 1 2 3; do
+            echo "=== Tentative $i ==="
+            if flutter build ios --release --no-codesign; then
+              exit 0
+            fi
+            rm -rf ~/Library/Developer/Xcode/DerivedData
+            rm -rf ~/Library/Caches/org.swift.swiftpm
+            rm -rf ~/Library/org.swift.swiftpm
+            rm -rf ios/.build ios/Runner.xcworkspace/xcshareddata/swiftpm
+            sleep 5
+          done
+          echo "Les 3 tentatives ont echoue."
+          exit 1
+ 
+      - name: Fabriquer l'IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry FluffyChat-DIAG.ipa Payload
+ 
+      - name: Publier l'IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluffyChat-DIAG-ipa
+          path: FluffyChat-DIAG.ipa
