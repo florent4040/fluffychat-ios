@@ -4,39 +4,55 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Tag ou branche de FluffyChat à compiler (ex: main ou v2.0.0)"
+        description: "Tag ou branche de FluffyChat à compiler (ex: main ou un tag de version)"
         default: "main"
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Récupérer le code de FluffyChat
+      - name: Récupérer le code officiel de FluffyChat
         uses: actions/checkout@v4
         with:
           repository: krille-chan/fluffychat
           ref: ${{ github.event.inputs.ref }}
 
-      - name: Lire la version de Flutter attendue par le projet
+      # Le dépôt officiel contient un fichier .tool_versions.yaml à la racine.
+      # On y cherche la version de Flutter ; si rien n'est trouvé, on prend la dernière stable.
+      - name: Détecter la version de Flutter du projet
+        id: flutter_version
         run: |
-          if [ -f .github/workflows/versions.env ]; then
-            cat .github/workflows/versions.env >> $GITHUB_ENV
+          VERSION=""
+          if [ -f .tool_versions.yaml ]; then
+            echo "--- .tool_versions.yaml ---"
+            cat .tool_versions.yaml
+            VERSION=$(grep -i flutter .tool_versions.yaml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
           fi
+          echo "Version de Flutter détectée : '${VERSION}'"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
           channel: stable
           cache: true
 
-      - name: Installer Rust (nécessaire pour vodozemac)
+      # FluffyChat a besoin de Rust (vodozemac, compilé pendant le build iOS)
+      - name: Installer Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
 
+      # Xcode plante pendant la résolution des paquets Swift (Firebase...) sur le runner.
+      # On force Flutter à utiliser CocoaPods à la place.
+      - name: Désactiver Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
       - name: Dépendances
         run: flutter pub get
 
+      # On n'utilise pas scripts/build-ios.sh : il suppose un compte développeur
+      # et une signature gérée par Xcode. Ici on compile sans signature.
       - name: Compiler sans signature
         run: flutter build ios --release --no-codesign
 
@@ -44,7 +60,7 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
-          zip -qr FluffyChat-unsigned.ipa Payload
+          zip -qry FluffyChat-unsigned.ipa Payload
 
       - name: Publier l'IPA
         uses: actions/upload-artifact@v4
