@@ -134,9 +134,28 @@ jobs:
           PYEOF
           grep -n "_d(" lib/main.dart | head -30
  
-      # Echoue vite (1-2 min) si le patch contient une erreur de syntaxe
+      # Correctif : sans "App Group" (cas du sideload), iOS ne donne pas de dossier partage
+      # et le code officiel plante sur "containerPath!". On utilise alors le dossier temporaire.
+      - name: Corriger le dossier de stockage (App Group absent)
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          p = 'lib/utils/matrix_sdk_extensions/flutter_matrix_dart_sdk_database/builder.dart'
+          s = open(p, encoding='utf-8').read()
+          old = "      temporaryDirectory = Directory(containerPath!);\n"
+          new = "      temporaryDirectory = containerPath != null\n          ? Directory(containerPath)\n          : await getTemporaryDirectory();\n"
+          n = s.count(old)
+          if n != 1:
+              print('ECHEC du correctif, motif trouve %d fois' % n)
+              sys.exit(1)
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new))
+          print('Correctif applique.')
+          PYEOF
+          grep -n "containerPath" lib/utils/matrix_sdk_extensions/flutter_matrix_dart_sdk_database/builder.dart
+ 
+      # Echoue vite (1-2 min) si un patch contient une erreur de syntaxe
       - name: Verifier que le code compile
-        run: flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings lib/main.dart
+        run: flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings lib/main.dart lib/utils/matrix_sdk_extensions/flutter_matrix_dart_sdk_database/builder.dart
  
       - name: Compiler sans signature (3 tentatives)
         run: |
@@ -158,10 +177,10 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
-          zip -qry FluffyChat-DIAG.ipa Payload
+          zip -qry FluffyChat-FIX.ipa Payload
  
       - name: Publier l'IPA
         uses: actions/upload-artifact@v4
         with:
-          name: FluffyChat-DIAG-ipa
-          path: FluffyChat-DIAG.ipa
+          name: FluffyChat-FIX-ipa
+          path: FluffyChat-FIX.ipa
