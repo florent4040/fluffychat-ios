@@ -1,39 +1,60 @@
-name: FluffyChat iOS (IPA non signé)
+name: FluffyChat iOS - compiler une version (IPA non signe)
 
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Tag ou branche de FluffyChat à compiler (ex: main ou un tag de version)"
-        default: "v2.10.0"
+      version:
+        description: "Version de FluffyChat : latest (derniere version stable) ou un tag precis, ex. v2.11.3"
+        default: "latest"
+      diagnostic:
+        description: "Mode depannage : affiche les etapes de demarrage et les erreurs a l'ecran"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 90
     steps:
-      - name: Récupérer le code officiel de FluffyChat
+      # 1. Quelle version compiler ?
+      - name: Determiner la version a compiler
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.inputs.version }}
+        run: |
+          if [ -z "$REQUESTED" ] || [ "$REQUESTED" = "latest" ]; then
+            TAG=$(gh api repos/krille-chan/fluffychat/releases/latest --jq .tag_name)
+          else
+            TAG="$REQUESTED"
+          fi
+          echo "Version retenue : $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # 2. Code officiel de FluffyChat
+      - name: Recuperer le code officiel de FluffyChat
         uses: actions/checkout@v4
         with:
           repository: krille-chan/fluffychat
-          ref: ${{ github.event.inputs.ref }}
+          ref: ${{ steps.resolve.outputs.tag }}
 
-      # On cherche la version de Flutter du projet (.fvmrc, sinon .tool_versions.yaml).
-      # Si rien n'est trouvé, on prend la dernière stable.
-      - name: Détecter la version de Flutter du projet
+      # 3. Version de Flutter exigee par le projet (.fvmrc, sinon .tool_versions.yaml)
+      - name: Detecter la version de Flutter du projet
         id: flutter_version
         run: |
           VERSION=""
           if [ -f .fvmrc ]; then
-            echo "--- .fvmrc ---"
             cat .fvmrc
             VERSION=$(grep -i flutter .fvmrc | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
           fi
           if [ -z "$VERSION" ] && [ -f .tool_versions.yaml ]; then
-            echo "--- .tool_versions.yaml ---"
             cat .tool_versions.yaml
             VERSION=$(grep -i flutter .tool_versions.yaml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
           fi
-          echo "Version de Flutter détectée : '${VERSION}'"
+          echo "Version de Flutter detectee : '${VERSION}'"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - uses: subosito/flutter-action@v2
@@ -42,27 +63,140 @@ jobs:
           channel: stable
           cache: true
 
-      # FluffyChat a besoin de Rust (vodozemac, compilé pendant le build iOS)
       - name: Installer Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
 
-      # Le plugin receive_sharing_intent n'est compatible qu'avec Swift Package Manager :
-      # on doit donc l'activer (le désactiver fait échouer le build).
+      # Le plugin receive_sharing_intent n'est compatible qu'avec Swift Package Manager
       - name: Activer Swift Package Manager
         run: flutter config --enable-swift-package-manager
 
-      - name: Versions d'Xcode disponibles (diagnostic)
-        run: |
-          xcodebuild -version
-          ls /Applications | grep -i xcode || true
-
-      - name: Dépendances
+      - name: Dependances
         run: flutter pub get
 
-      # Xcode plante parfois pendant la résolution des paquets Swift (crash interne).
-      # On réessaie jusqu'à 3 fois en nettoyant les caches entre chaque tentative.
+      # 4. Correctifs pour le sideload : l'App Group "group.im.fluffychat.app" appartient a
+      #    l'equipe officielle et n'existe pas dans ton profil de signature. Le code officiel
+      #    y fait appel a deux endroits :
+      #      a) dossier de stockage : plante sur "containerPath!" (ecran blanc)
+      #      b) trousseau iOS : erreur -34018, connexion impossible et base non chiffree
+      #    On utilise donc le dossier temporaire et le trousseau prive de l'app.
+      #    Ne touche que cette copie de build, jamais le depot officiel.
+      - name: Corriger les acces App Group (dossier + trousseau)
+        id: fix
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys
+          status = []
+
+          def patch(path, old, new, absent, label):
+              s = open(path, encoding='utf-8').read()
+              if s.count(old) == 1:
+                  open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+                  print(label + ' : correctif applique')
+                  status.append(label + ' applique')
+              elif absent not in s:
+                  print(label + ' : correctif inutile (code amont modifie)')
+                  status.append(label + ' inutile')
+              else:
+                  print('ECHEC : le code a change, le correctif ' + label + ' ne s applique plus. A revoir.')
+                  sys.exit(1)
+
+          base = 'lib/utils/matrix_sdk_extensions/flutter_matrix_dart_sdk_database/'
+          patch(base + 'builder.dart',
+                "      temporaryDirectory = Directory(containerPath!);\n",
+                ("      temporaryDirectory = containerPath != null\n"
+                 "          ? Directory(containerPath)\n"
+                 "          : await getTemporaryDirectory();\n"),
+                'containerPath!', 'dossier')
+          patch(base + 'cipher.dart',
+                "  groupId: 'group.im.fluffychat.app',\n",
+                "",
+                "groupId: 'group.im.fluffychat.app'", 'trousseau')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('status=%s\n' % ', '.join(status))
+          PYEOF
+          echo "--- Autres mentions de l'App Group dans le code (information) ---"
+          grep -rn "group.im.fluffychat" lib ios 2>/dev/null | head -20 || true
+
+      # 5. (Optionnel) Mode depannage : ecran vert avec les etapes de demarrage et les erreurs
+      - name: Ajouter l'affichage de diagnostic (mode depannage)
+        if: ${{ inputs.diagnostic }}
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          p = 'lib/main.dart'
+          s = open(p, encoding='utf-8').read()
+
+          def rep(old, new):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  print('ECHEC du patch, motif trouve %d fois : %r' % (n, old[:70]))
+                  sys.exit(1)
+              s = s.replace(old, new)
+
+          DIAG = r'''
+          // ---- DIAGNOSTIC (ajoute par le workflow) ----
+          final ValueNotifier<String> _diag = ValueNotifier<String>('FluffyChat diagnostic');
+
+          void _d(String m) {
+            final t = DateTime.now().toIso8601String().substring(11, 19);
+            _diag.value = '${_diag.value}\n$t $m';
+          }
+
+          void _diagShow() {
+            runApp(
+              Directionality(
+                textDirection: TextDirection.ltr,
+                child: Container(
+                  color: const Color(0xFF004D40),
+                  padding: const EdgeInsets.fromLTRB(16, 60, 16, 16),
+                  child: SingleChildScrollView(
+                    child: ValueListenableBuilder<String>(
+                      valueListenable: _diag,
+                      builder: (_, v, __) => Text(
+                        v,
+                        style: const TextStyle(
+                          color: Color(0xFFFFFFFF),
+                          fontSize: 13,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+          // ---- FIN DIAGNOSTIC ----
+          '''
+
+          rep("ReceivePort? mainIsolateReceivePort;\n",
+              "ReceivePort? mainIsolateReceivePort;\n" + DIAG)
+          rep("  WidgetsFlutterBinding.ensureInitialized();\n\n  final store = await AppSettings.init();\n",
+              "  WidgetsFlutterBinding.ensureInitialized();\n  _diagShow();\n  _d('1 moteur Flutter OK');\n  _d('2 AppSettings.init ...');\n  final store = await AppSettings.init();\n  _d('2 AppSettings OK');\n")
+          rep("  if (!_vodozemacInitialized) {\n    await vod.init(\n",
+              "  _d('3 vodozemac init ...');\n  if (!_vodozemacInitialized) {\n    await vod.init(\n")
+          rep("  Logs().nativeColors = !PlatformInfos.isIOS;\n",
+              "  _d('3 vodozemac OK');\n  Logs().nativeColors = !PlatformInfos.isIOS;\n")
+          rep("  final clients = await ClientManager.getClients(store: store);\n\n  // Started in foreground mode.\n",
+              "  _d('4 ouverture des comptes et de la base ...');\n  final clients = await ClientManager.getClients(store: store);\n  _d('4 comptes OK');\n\n  // Started in foreground mode.\n")
+          rep("  // Preload first client\n",
+              "  _d('5a lecture PIN OK, chargement du 1er compte ...');\n  // Preload first client\n")
+          rep("  await firstClient?.accountDataLoading;\n",
+              "  await firstClient?.accountDataLoading;\n  _d('5b chargement du compte OK');\n")
+          rep("  runApp(\n    FluffyChatApp(\n",
+              "  _d('6 lancement de l interface dans 4 secondes');\n  await Future.delayed(const Duration(seconds: 4));\n  runApp(\n    FluffyChatApp(\n")
+          rep("}, ErrorReporter.onFlutterError);\n",
+              "}, (Object e, StackTrace st) {\n  _d('ERREUR : $e\\n$st');\n  try {\n    ErrorReporter.onFlutterError(e, st);\n  } catch (_) {}\n});\n")
+
+          open(p, 'w', encoding='utf-8').write(s)
+          print('Patch de diagnostic applique.')
+          PYEOF
+
+      # 6. Compilation (Xcode plante parfois pendant la resolution des paquets Swift : on reessaie)
       - name: Compiler sans signature (3 tentatives)
         run: |
           for i in 1 2 3; do
@@ -70,38 +204,45 @@ jobs:
             if flutter build ios --release --no-codesign; then
               exit 0
             fi
-            echo "Échec, nettoyage des caches Xcode/SwiftPM avant nouvel essai..."
+            echo "Echec, nettoyage des caches avant un nouvel essai..."
             rm -rf ~/Library/Developer/Xcode/DerivedData
             rm -rf ~/Library/Caches/org.swift.swiftpm
             rm -rf ~/Library/org.swift.swiftpm
             rm -rf ios/.build ios/Runner.xcworkspace/xcshareddata/swiftpm
             sleep 5
           done
-          echo "Les 3 tentatives ont échoué."
+          echo "Les 3 tentatives ont echoue."
           exit 1
 
-      - name: Inspecter l'app compilée (diagnostic)
-        run: |
-          APP=build/ios/iphoneos/Runner.app
-          echo "--- Frameworks ---"
-          ls "$APP/Frameworks" || true
-          echo "--- Bibliothèques vodozemac / dylib ---"
-          find "$APP" \( -iname "*vodozemac*" -o -iname "*.dylib" \) | head -50
-          echo "--- Info.plist (extraits) ---"
-          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion|MinimumOSVersion|UIApplicationSceneManifest|DTSDKName|DTXcode" || true
-          echo "--- Architecture ---"
-          lipo -info "$APP/Runner" || file "$APP/Runner"
-          echo "--- Taille ---"
-          du -sh "$APP"
-
+      # 7. Fabrication de l'IPA
       - name: Fabriquer l'IPA
+        id: pack
         run: |
+          VERSION=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
+          NAME="FluffyChat-${VERSION}-non-signe"
+          if [ "${{ inputs.diagnostic }}" = "true" ]; then
+            NAME="${NAME}-diagnostic"
+          fi
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
-          zip -qry FluffyChat-unsigned.ipa Payload
+          zip -qry "${NAME}.ipa" Payload
+          ls -lh "${NAME}.ipa"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Publier l'IPA
         uses: actions/upload-artifact@v4
         with:
-          name: FluffyChat-unsigned-ipa
-          path: FluffyChat-unsigned.ipa
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.name }}.ipa
+          retention-days: 90
+
+      - name: Resume
+        run: |
+          {
+            echo "## FluffyChat ${{ steps.resolve.outputs.tag }} compile"
+            echo ""
+            echo "- Flutter : ${{ steps.flutter_version.outputs.version }}"
+            echo "- Correctifs App Group : ${{ steps.fix.outputs.status }}"
+            echo "- Mode depannage : ${{ inputs.diagnostic }}"
+            echo "- Fichier : ${{ steps.pack.outputs.name }}.ipa (a signer avec ton certificat)"
+          } >> "$GITHUB_STEP_SUMMARY"
