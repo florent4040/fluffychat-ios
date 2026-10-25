@@ -1,0 +1,53 @@
+name: FluffyChat iOS (IPA non signé)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag ou branche de FluffyChat à compiler (ex: main ou v2.0.0)"
+        default: "main"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Récupérer le code de FluffyChat
+        uses: actions/checkout@v4
+        with:
+          repository: krille-chan/fluffychat
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Lire la version de Flutter attendue par le projet
+        run: |
+          if [ -f .github/workflows/versions.env ]; then
+            cat .github/workflows/versions.env >> $GITHUB_ENV
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Installer Rust (nécessaire pour vodozemac)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Dépendances
+        run: flutter pub get
+
+      - name: Compiler sans signature
+        run: flutter build ios --release --no-codesign
+
+      - name: Fabriquer l'IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qr FluffyChat-unsigned.ipa Payload
+
+      - name: Publier l'IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluffyChat-unsigned-ipa
+          path: FluffyChat-unsigned.ipa
