@@ -1,12 +1,12 @@
 name: FluffyChat iOS (IPA non signé)
- 
+
 on:
   workflow_dispatch:
     inputs:
       ref:
         description: "Tag ou branche de FluffyChat à compiler (ex: main ou un tag de version)"
         default: "main"
- 
+
 jobs:
   build:
     runs-on: macos-latest
@@ -16,48 +16,51 @@ jobs:
         with:
           repository: krille-chan/fluffychat
           ref: ${{ github.event.inputs.ref }}
- 
-      # Le dépôt officiel contient un fichier .tool_versions.yaml à la racine.
-      # On y cherche la version de Flutter ; si rien n'est trouvé, on prend la dernière stable.
+
+      # On cherche la version de Flutter du projet (.fvmrc, sinon .tool_versions.yaml).
+      # Si rien n'est trouvé, on prend la dernière stable.
       - name: Détecter la version de Flutter du projet
         id: flutter_version
         run: |
           VERSION=""
-          if [ -f .tool_versions.yaml ]; then
+          if [ -f .fvmrc ]; then
+            echo "--- .fvmrc ---"
+            cat .fvmrc
+            VERSION=$(grep -i flutter .fvmrc | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+          fi
+          if [ -z "$VERSION" ] && [ -f .tool_versions.yaml ]; then
             echo "--- .tool_versions.yaml ---"
             cat .tool_versions.yaml
             VERSION=$(grep -i flutter .tool_versions.yaml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
           fi
           echo "Version de Flutter détectée : '${VERSION}'"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
- 
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ steps.flutter_version.outputs.version }}
           channel: stable
           cache: true
- 
+
       # FluffyChat a besoin de Rust (vodozemac, compilé pendant le build iOS)
       - name: Installer Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
- 
+
       # Le plugin receive_sharing_intent n'est compatible qu'avec Swift Package Manager :
       # on doit donc l'activer (le désactiver fait échouer le build).
       - name: Activer Swift Package Manager
         run: flutter config --enable-swift-package-manager
- 
+
       - name: Versions d'Xcode disponibles (diagnostic)
         run: |
           xcodebuild -version
           ls /Applications | grep -i xcode || true
- 
+
       - name: Dépendances
         run: flutter pub get
- 
-      # On n'utilise pas scripts/build-ios.sh : il suppose un compte développeur
-      # et une signature gérée par Xcode. Ici on compile sans signature.
+
       # Xcode plante parfois pendant la résolution des paquets Swift (crash interne).
       # On réessaie jusqu'à 3 fois en nettoyant les caches entre chaque tentative.
       - name: Compiler sans signature (3 tentatives)
@@ -76,7 +79,7 @@ jobs:
           done
           echo "Les 3 tentatives ont échoué."
           exit 1
- 
+
       - name: Inspecter l'app compilée (diagnostic)
         run: |
           APP=build/ios/iphoneos/Runner.app
@@ -90,16 +93,15 @@ jobs:
           lipo -info "$APP/Runner" || file "$APP/Runner"
           echo "--- Taille ---"
           du -sh "$APP"
- 
+
       - name: Fabriquer l'IPA
         run: |
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
           zip -qry FluffyChat-unsigned.ipa Payload
- 
+
       - name: Publier l'IPA
         uses: actions/upload-artifact@v4
         with:
           name: FluffyChat-unsigned-ipa
           path: FluffyChat-unsigned.ipa
- 
