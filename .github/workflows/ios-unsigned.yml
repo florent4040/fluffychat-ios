@@ -1,12 +1,12 @@
 name: FluffyChat iOS (IPA non signé)
-
+ 
 on:
   workflow_dispatch:
     inputs:
       ref:
         description: "Tag ou branche de FluffyChat à compiler (ex: main ou un tag de version)"
         default: "main"
-
+ 
 jobs:
   build:
     runs-on: macos-latest
@@ -16,7 +16,7 @@ jobs:
         with:
           repository: krille-chan/fluffychat
           ref: ${{ github.event.inputs.ref }}
-
+ 
       # Le dépôt officiel contient un fichier .tool_versions.yaml à la racine.
       # On y cherche la version de Flutter ; si rien n'est trouvé, on prend la dernière stable.
       - name: Détecter la version de Flutter du projet
@@ -30,40 +30,62 @@ jobs:
           fi
           echo "Version de Flutter détectée : '${VERSION}'"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
+ 
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ steps.flutter_version.outputs.version }}
           channel: stable
           cache: true
-
+ 
       # FluffyChat a besoin de Rust (vodozemac, compilé pendant le build iOS)
       - name: Installer Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
-
-      # Xcode plante pendant la résolution des paquets Swift (Firebase...) sur le runner.
-      # On force Flutter à utiliser CocoaPods à la place.
-      - name: Désactiver Swift Package Manager
-        run: flutter config --no-enable-swift-package-manager
-
+ 
+      # Le plugin receive_sharing_intent n'est compatible qu'avec Swift Package Manager :
+      # on doit donc l'activer (le désactiver fait échouer le build).
+      - name: Activer Swift Package Manager
+        run: flutter config --enable-swift-package-manager
+ 
+      - name: Versions d'Xcode disponibles (diagnostic)
+        run: |
+          xcodebuild -version
+          ls /Applications | grep -i xcode || true
+ 
       - name: Dépendances
         run: flutter pub get
-
+ 
       # On n'utilise pas scripts/build-ios.sh : il suppose un compte développeur
       # et une signature gérée par Xcode. Ici on compile sans signature.
-      - name: Compiler sans signature
-        run: flutter build ios --release --no-codesign
-
+      # Xcode plante parfois pendant la résolution des paquets Swift (crash interne).
+      # On réessaie jusqu'à 3 fois en nettoyant les caches entre chaque tentative.
+      - name: Compiler sans signature (3 tentatives)
+        run: |
+          for i in 1 2 3; do
+            echo "=== Tentative $i ==="
+            if flutter build ios --release --no-codesign; then
+              exit 0
+            fi
+            echo "Échec, nettoyage des caches Xcode/SwiftPM avant nouvel essai..."
+            rm -rf ~/Library/Developer/Xcode/DerivedData
+            rm -rf ~/Library/Caches/org.swift.swiftpm
+            rm -rf ~/Library/org.swift.swiftpm
+            rm -rf ios/.build ios/Runner.xcworkspace/xcshareddata/swiftpm
+            sleep 5
+          done
+          echo "Les 3 tentatives ont échoué."
+          exit 1
+ 
       - name: Fabriquer l'IPA
         run: |
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
           zip -qry FluffyChat-unsigned.ipa Payload
-
+ 
       - name: Publier l'IPA
         uses: actions/upload-artifact@v4
         with:
           name: FluffyChat-unsigned-ipa
           path: FluffyChat-unsigned.ipa
+ 
